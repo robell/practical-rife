@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.library import register_fake
 from train_log.IFNet_helpers import (
     TimestepFold,
     fold_scale_state_dict,
@@ -11,20 +12,116 @@ from train_log.IFNet_helpers import (
 # from train_log.refine import *
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-backwarp_tenGrid = {}
 
 def warp(tenInput, tenFlow):
-    k = (str(tenFlow.device), str(tenFlow.size()))
-    if k not in backwarp_tenGrid:
-        tenHorizontal = torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=device).view(
-            1, 1, 1, tenFlow.shape[3]).expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
-        tenVertical = torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=device).view(
-            1, 1, tenFlow.shape[2], 1).expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
-        backwarp_tenGrid[k] = torch.cat(
-            [tenHorizontal, tenVertical], 1).to(device)
-
-    g = (backwarp_tenGrid[k] + tenFlow).permute(0, 2, 3, 1)
+    tenHorizontal = torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=device).view(
+        1, 1, 1, tenFlow.shape[3]).expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
+    tenVertical = torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=device).view(
+        1, 1, tenFlow.shape[2], 1).expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
+    g = (torch.cat([tenHorizontal, tenVertical], 1).to(device) + tenFlow).permute(0, 2, 3, 1)
     return torch.nn.functional.grid_sample(input=tenInput, grid=g, mode='bilinear', padding_mode='border', align_corners=True)
+
+def downsample_even_scale(tenInput, scale):
+    return F.interpolate(
+        tenInput,
+        scale_factor=1.0 / scale,
+        mode="bilinear",
+        align_corners=False,
+    )
+
+@torch.library.custom_op("rife::warp_downsample8", mutates_args=())
+def warp_downsample8(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
+    return downsample_even_scale(warp(tenInput, tenFlow), 8)
+
+@torch.library.custom_op("rife::warp_downsample4", mutates_args=())
+def warp_downsample4(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
+    return downsample_even_scale(warp(tenInput, tenFlow), 4)
+
+@torch.library.custom_op("rife::warp_downsample2", mutates_args=())
+def warp_downsample2(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
+    return downsample_even_scale(warp(tenInput, tenFlow), 2)
+
+def _warp_downsample_fake_output(
+    tenInput: torch.Tensor,
+    tenFlow: torch.Tensor,
+    scale: int,
+) -> torch.Tensor:
+    _ = tenFlow
+    return torch.empty(
+        (
+            tenInput.shape[0],
+            tenInput.shape[1],
+            tenInput.shape[2] // scale,
+            tenInput.shape[3] // scale,
+        ),
+        dtype=tenInput.dtype,
+        device=tenInput.device,
+    )
+
+@register_fake("rife::warp_downsample8")
+def _warp_downsample8_fake(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
+    return _warp_downsample_fake_output(tenInput, tenFlow, 8)
+
+@register_fake("rife::warp_downsample4")
+def _warp_downsample4_fake(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
+    return _warp_downsample_fake_output(tenInput, tenFlow, 4)
+
+@register_fake("rife::warp_downsample2")
+def _warp_downsample2_fake(tenInput: torch.Tensor, tenFlow: torch.Tensor) -> torch.Tensor:
+    return _warp_downsample_fake_output(tenInput, tenFlow, 2)
+
+def _make_warp_downsample_setup(scale):
+    def setup_context(ctx, inputs, output):
+        _ = output
+        ctx.scale = scale
+        ctx.save_for_backward(inputs[0], inputs[1])
+
+    return setup_context
+
+def _make_warp_downsample_backward(scale):
+    def backward(ctx, grad_output):
+        tenInput, tenFlow = ctx.saved_tensors
+        input_requires_grad = tenInput.is_floating_point()
+        flow_requires_grad = tenFlow.is_floating_point()
+        if not input_requires_grad and not flow_requires_grad:
+            return None, None, None
+
+        with torch.enable_grad():
+            tenInput_req = tenInput.detach()
+            tenFlow_req = tenFlow.detach()
+            if input_requires_grad:
+                tenInput_req.requires_grad_(True)
+            if flow_requires_grad:
+                tenFlow_req.requires_grad_(True)
+            result = downsample_even_scale(
+                warp(tenInput_req, tenFlow_req),
+                scale,
+            )
+            grad_input, grad_flow = torch.autograd.grad(
+                result,
+                (tenInput_req, tenFlow_req),
+                grad_output,
+                allow_unused=True,
+            )
+        return grad_input, grad_flow
+
+    return backward
+
+for _warp_downsample_scale in (8, 4, 2):
+    torch.library.register_autograd(
+        f"rife::warp_downsample{_warp_downsample_scale}",
+        _make_warp_downsample_backward(_warp_downsample_scale),
+        setup_context=_make_warp_downsample_setup(_warp_downsample_scale),
+    )
+
+def warp_downsample_for_scale(tenInput, tenFlow, scale):
+    if scale == 8:
+        return torch.ops.rife.warp_downsample8.default(tenInput, tenFlow)
+    if scale == 4:
+        return torch.ops.rife.warp_downsample4.default(tenInput, tenFlow)
+    if scale == 2:
+        return torch.ops.rife.warp_downsample2.default(tenInput, tenFlow)
+    raise ValueError(f"Unsupported warp downsample scale: {scale}")
 
 def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
     return nn.Sequential(
@@ -287,43 +384,49 @@ class IFNet(nn.Module):
             output_scale=self.block1.scale,
         )
 
-        warped_img0 = warp(img0, flow[:, :2])
-        warped_img1 = warp(img1, flow[:, 2:4])
-        wf0 = warp(f0, flow[:, :2])
-        wf1 = warp(f1, flow[:, 2:4])
+        warped_img0 = warp_downsample_for_scale(img0, flow[:, :2], self.block1.scale)
+        warped_img1 = warp_downsample_for_scale(img1, flow[:, 2:4], self.block1.scale)
+        wf0 = warp_downsample_for_scale(f0, flow[:, :2], self.block1.scale)
+        wf1 = warp_downsample_for_scale(f1, flow[:, 2:4], self.block1.scale)
 
         # --- Block 1 ---
         fd, mask, feat = self.block1(
-            (warped_img0[:, :3], warped_img1[:, :3], wf0, wf1),
-            native_scale_inputs=(mask, feat),
+            (),
+            native_scale_inputs=(
+                warped_img0[:, :3], warped_img1[:, :3], wf0, wf1, mask, feat
+            ),
             trailing_inputs=(flow,),
             output_scale=self.block2.scale,
         )
         flow = flow + fd
-        
-        warped_img0 = warp(img0, flow[:, :2])
-        warped_img1 = warp(img1, flow[:, 2:4])
-        wf0 = warp(f0, flow[:, :2])
-        wf1 = warp(f1, flow[:, 2:4])
+
+        warped_img0 = warp_downsample_for_scale(img0, flow[:, :2], self.block2.scale)
+        warped_img1 = warp_downsample_for_scale(img1, flow[:, 2:4], self.block2.scale)
+        wf0 = warp_downsample_for_scale(f0, flow[:, :2], self.block2.scale)
+        wf1 = warp_downsample_for_scale(f1, flow[:, 2:4], self.block2.scale)
 
         # --- Block 2 ---
         fd, mask, feat = self.block2(
-            (warped_img0[:, :3], warped_img1[:, :3], wf0, wf1),
-            native_scale_inputs=(mask, feat),
+            (),
+            native_scale_inputs=(
+                warped_img0[:, :3], warped_img1[:, :3], wf0, wf1, mask, feat
+            ),
             trailing_inputs=(flow,),
             output_scale=self.block3.scale,
         )
         flow = flow + fd
 
-        warped_img0 = warp(img0, flow[:, :2])
-        warped_img1 = warp(img1, flow[:, 2:4])
-        wf0 = warp(f0, flow[:, :2])
-        wf1 = warp(f1, flow[:, 2:4])
+        warped_img0 = warp_downsample_for_scale(img0, flow[:, :2], self.block3.scale)
+        warped_img1 = warp_downsample_for_scale(img1, flow[:, 2:4], self.block3.scale)
+        wf0 = warp_downsample_for_scale(f0, flow[:, :2], self.block3.scale)
+        wf1 = warp_downsample_for_scale(f1, flow[:, 2:4], self.block3.scale)
 
         # --- Block 3 ---
         fd, mask, feat = self.block3(
-            (warped_img0[:, :3], warped_img1[:, :3], wf0, wf1),
-            native_scale_inputs=(mask, feat),
+            (),
+            native_scale_inputs=(
+                warped_img0[:, :3], warped_img1[:, :3], wf0, wf1, mask, feat
+            ),
             trailing_inputs=(flow,),
             output_scale=self.block4.scale,
         )
