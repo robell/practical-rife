@@ -452,3 +452,47 @@ class IFNet(nn.Module):
         result = (warped_img0 * mask + warped_img1 * (1 - mask))
 
         return None, None, [result]
+
+class IFNetTwoBlock(nn.Module):
+    def __init__(self):
+        super(IFNetTwoBlock, self).__init__()
+        self.block0 = IFBlock(7 + 8, c=192, scale=2)
+        self.block1 = IFBlock(
+            8 + 4 + 8 + 8,
+            c=128,
+            scale=1,
+            output_feat=False,
+            input_flow_channels=4,
+        )
+        self.encode = Head()
+
+    def forward(self, x, timestep=0.5, scale_list=None):
+        channel = x.shape[1] // 2
+        img0 = x[:, :channel]
+        img1 = x[:, channel:]
+
+        f0 = self.encode(img0[:, :3])
+        f1 = self.encode(img1[:, :3])
+
+        flow, mask, feat = self.block0(
+            (img0[:, :3], img1[:, :3], f0, f1),
+            output_scale=self.block1.scale,
+        )
+
+        warped_img0 = warp(img0, flow[:, :2])
+        warped_img1 = warp(img1, flow[:, 2:4])
+        wf0 = warp(f0, flow[:, :2])
+        wf1 = warp(f1, flow[:, 2:4])
+
+        fd, mask, _ = self.block1(
+            (warped_img0[:, :3], warped_img1[:, :3], wf0, wf1),
+            native_scale_inputs=(mask, feat),
+            trailing_inputs=(flow,),
+        )
+        flow = flow + fd
+
+        warped_img0 = warp(img0, flow[:, :2])
+        warped_img1 = warp(img1, flow[:, 2:4])
+        mask = torch.sigmoid(mask)
+        result = warped_img0 * mask + warped_img1 * (1 - mask)
+        return None, None, [result]
