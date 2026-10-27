@@ -375,7 +375,16 @@ class IFNet(nn.Module):
         # Encode input to flow
         f0 = self.encode(img0[:, :3])
         f1 = self.encode(img1[:, :3])
+        result = self._interpolate(img0, img1, f0, f1)
+        return None, None, [result]
 
+    def forward_cached(self, img0, img1, previous_features):
+        """Interpolate a pair using img0's features and return img1's features."""
+        current_features = self.encode(img1[:, :3])
+        result = self._interpolate(img0, img1, previous_features, current_features)
+        return result, current_features
+
+    def _interpolate(self, img0, img1, f0, f1):
         warped_img0 = img0
         warped_img1 = img1
         flow = None
@@ -459,7 +468,7 @@ class IFNet(nn.Module):
         mask = torch.sigmoid(mask)
         result = (warped_img0 * mask + warped_img1 * (1 - mask))
 
-        return None, None, [result]
+        return result
 
 class IFNetTwoBlock(nn.Module):
     def __init__(self):
@@ -481,7 +490,16 @@ class IFNetTwoBlock(nn.Module):
 
         f0 = self.encode(img0[:, :3])
         f1 = self.encode(img1[:, :3])
+        result = self._interpolate(img0, img1, f0, f1)
+        return None, None, [result]
 
+    def forward_cached(self, img0, img1, previous_features):
+        """Interpolate a pair using img0's features and return img1's features."""
+        current_features = self.encode(img1[:, :3])
+        result = self._interpolate(img0, img1, previous_features, current_features)
+        return result, current_features
+
+    def _interpolate(self, img0, img1, f0, f1):
         flow, mask, feat = self.block0(
             (img0[:, :3], img1[:, :3], f0, f1),
             output_scale=self.block1.scale,
@@ -505,4 +523,17 @@ class IFNetTwoBlock(nn.Module):
         warped_img1 = warp(img1, flow1)
         mask = torch.sigmoid(mask)
         result = warped_img0 * mask + warped_img1 * (1 - mask)
-        return None, None, [result]
+        return result
+
+
+class CachedIFNet(nn.Module):
+    """Expose a model's cached inference entry point as an exportable module."""
+
+    def __init__(self, flownet):
+        super().__init__()
+        self.flownet = flownet
+
+    def forward(self, previous_frame, current_frame, previous_features):
+        return self.flownet.forward_cached(
+            previous_frame, current_frame, previous_features
+        )

@@ -127,3 +127,58 @@ Optical Flow:
 
 Video Interpolation: 
 [DVF](https://github.com/lxx1991/pytorch-voxel-flow)  [TOflow](https://github.com/Coldog2333/pytoflow)  [SepConv](https://github.com/sniklaus/sepconv-slomo)  [DAIN](https://github.com/baowenbo/DAIN)  [CAIN](https://github.com/myungsub/CAIN)  [MEMC-Net](https://github.com/baowenbo/MEMC-Net)   [SoftSplat](https://github.com/sniklaus/softmax-splatting)  [BMBC](https://github.com/JunHeum/BMBC)  [EDSC](https://github.com/Xianhang/EDSC-pytorch)  [EQVI](https://github.com/lyh-18/EQVI) [RIFE](https://github.com/hzwer/arXiv2020-RIFE)
+
+## Reusing frame features
+
+`IFNet` and `IFNetTwoBlock` expose `forward_cached` for sequential interpolation.
+The caller provides the first frame's encoded features and receives the second
+frame's features alongside the interpolated image:
+
+```python
+image, current_features = net.forward_cached(
+    previous_frame, current_frame, previous_features
+)
+```
+
+`CachedIFNet(net)` exposes this interface as an ordinary PyTorch module. Deploy
+one cached model and initialize each stream with a discarded first inference:
+
+```python
+import torch
+
+from train_log.IFNet_HDv3 import CachedIFNet, IFNetTwoBlock
+
+net = IFNetTwoBlock().eval()
+# Load a compatible checkpoint before starting the stream.
+cached = CachedIFNet(net)
+with torch.no_grad():
+    features = frame0.new_zeros((frame0.shape[0], 4, *frame0.shape[2:]))
+    _, features = cached(frame0, frame0, features)  # Discard the first image.
+    image01, features = cached(frame0, frame1, features)
+    image12, features = cached(frame1, frame2, features)
+```
+
+The feature output depends only on the current frame, so the discarded call
+initializes the cache without a separate encoder model. Alternatively, callers
+with direct access to the encoder can initialize with `net.encode(frame0)`.
+
+Frames use the same preprocessing, NCHW layout, dtype, and device as ordinary
+inference. The supported even input shapes produce four feature channels at the
+frame resolution. Export with distinct example tensors for the two frame
+arguments, since passing the same tensor object can specialize their aliasing.
+
+For each valid inference, the input features must correspond to the first frame
+and the same model weights. Prime the cache again when seeking, changing the
+input shape or preprocessing, or updating the weights. Keep separate caches for
+independent streams. Quantized deployment must use matching cache input and
+output quantization parameters.
+
+The existing `forward` interface and checkpoint parameter names are unchanged.
+Caching does not require ExecuTorch or a particular backend. An application can
+alternate two feature buffers to avoid overwriting a cache still being read.
+
+Run the eager, export, stream initialization, and gradient checks with:
+
+```sh
+python -m unittest test_cached
+```
