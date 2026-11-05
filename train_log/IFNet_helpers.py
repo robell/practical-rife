@@ -54,7 +54,7 @@ def fold_scale_state_dict(block, state_dict, prefix):
             state_dict[weight_key] = weight
     weight_key = prefix + "lastconv.0.weight"
     bias_key = prefix + "lastconv.0.bias"
-    flow_output_channels = 4 * block.lastconv[1].upscale_factor**2
+    flow_output_channels = 4 * block.pixel_shuffle_factor**2
     if weight_key in state_dict:
         weight = state_dict[weight_key].clone()
         weight[:, :flow_output_channels] *= scale

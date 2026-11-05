@@ -230,9 +230,11 @@ class IFBlock(nn.Module):
         scale=1,
         output_feat=True,
         input_flow_channels=0,
+        pixel_shuffle=True,
     ):
         super(IFBlock, self).__init__()
         self.output_feat = output_feat
+        self.pixel_shuffle_factor = 2 if pixel_shuffle else 1
         self.scale = scale
         self.input_flow_channels = input_flow_channels
         self.timestep_insert_channel = timestep_insert_channel
@@ -254,8 +256,10 @@ class IFBlock(nn.Module):
             ResConv(c),
         )
         self.lastconv = nn.Sequential(
-            nn.ConvTranspose2d(c, 4 * (13 if output_feat else 5), 4, 2, 1),
-            nn.PixelShuffle(2)
+            nn.ConvTranspose2d(
+                c, self.pixel_shuffle_factor**2 * (13 if output_feat else 5), 4, 2, 1
+            ),
+            nn.PixelShuffle(2) if pixel_shuffle else nn.Identity(),
         )
         if self.timestep_fold == TimestepFold.TIMESTEP_ADD:
             height = self._timestep_input_height // scale
@@ -350,11 +354,12 @@ class IFBlock(nn.Module):
             feat = self.conv0(x)
         feat = self.convblock(feat)
         tmp = self.lastconv(feat)
+        head_scale = scale * (2 // self.pixel_shuffle_factor)
         flow = F.interpolate(
-            tmp[:, :4], scale_factor=scale, mode="bilinear", align_corners=False
+            tmp[:, :4], scale_factor=head_scale, mode="bilinear", align_corners=False
         )
-        mask = self._resize_output_for_scale(tmp[:, 4:5], scale, output_scale)
-        feat = self._resize_output_for_scale(tmp[:, 5:], scale, output_scale)
+        mask = self._resize_output_for_scale(tmp[:, 4:5], head_scale, output_scale)
+        feat = self._resize_output_for_scale(tmp[:, 5:], head_scale, output_scale)
         return flow, mask, feat
 class IFNet(nn.Module):
     def __init__(self):
@@ -464,7 +469,7 @@ class IFNet(nn.Module):
 class IFNetTwoBlock(nn.Module):
     def __init__(self):
         super(IFNetTwoBlock, self).__init__()
-        self.block0 = IFBlock(7 + 8, c=192, scale=2)
+        self.block0 = IFBlock(7 + 8, c=192, scale=4, pixel_shuffle=False)
         self.block1 = IFBlock(
             8 + 4 + 8 + 8,
             c=128,
